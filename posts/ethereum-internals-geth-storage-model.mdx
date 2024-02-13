@@ -1,0 +1,99 @@
+---
+title: "Ethereum internals: Geth storage model"
+date: "2020-01-01"
+---
+
+An Ethereum blockchain client stores two sets of information: `Block data` and `State data`.
+
+`Block data` refers to the primitive objects of the system:
+
+- Header: Metadata for the block.
+- Body: The set of transactions for the block (in Ethereum, the uncle headers are also part of the body).
+- Receipts: The execution result of the block, one receipt per transaction.
+
+`State data` is the set of account and storage records of the chain. The state changes when a Transaction from the block gets executed with the EVM. Internally, the state is modeled as a Merkle tree.
+
+In this post, I am going to focus on how the `Block data` is stored in `Go-ethereum`.
+
+## Embedded KV-database
+
+`Go-ethereum` uses as the main storage engine an embedded kv database. An embedded database is a database management system that is integrated inside the same application, most often as an imported library and not as a separate external component. Historically, `go-ethereum` has used `leveldb` but it is in the process of switching to `pebbledb`.
+
+A `key-value` database stores the data as a set of records each one identified with a unique key. Then, it provides utilities to insert, query, and list range data based on this key. Unlike traditional relational databases, it does not provide a schema and lacks the possibility to create complex queries on top of the data like with SQL.
+
+As a workaround to have complex queries, developers can use the same kv primitives to manually construct ad-hoc indexes to query the data. For example, `go-ethereum` stores block headers by its hash (key) but also has kv entries for number→hash to resolve the block by its number (i.e. `eth_getBlockByNumber` endpoint).
+
+## Indexes
+
+All the objects in `leveldb` are stored under the same logical bucket of data. However, since we need to store different types of information, we need to introduce some mechanism to differentiate each set of data. `Go-ethereum` uses prefixes and suffixes to namespace the information.
+
+List of raw data stores:
+
+- `<header_prefix><number><hash>`: `<header>`
+  - Stores the block header in RLP format.
+- `<block_body_prefix><num><hash>`: `<body>`
+  - Stores the body (transactions and uncles) for the block in RLP format.
+- `<block_receipts_prefix><num><hash>`: `<receipts>`
+  - Stores the list of receipts for the block in RLP format.
+
+List of the indexes:
+
+- `<header_prefix><number><hash><difficulty_suffix>`: `<difficulty>`
+  - Maps a block (number, hash) to the total PoW difficulty up to that point.
+- `<header_prefix><number><header_suffix>`: `<hash>`
+  - Maps the blocks in the canonical chain to its hash.
+- `<header_number_prefix><hash>`: `<number>`
+  - Reverse index from block hash to number.
+  - A query to this index is required to retrieve the contents of a block by its hash.
+- `<txn_index_prefix><tx hash>`: `<block number>`
+  - Maps the transaction hash to the block in which the transaction was mined.
+  - This index must be rewritten and updated for every reorg of the chain.
+  - It would require 3 database reads to get a transaction by its hash: tx hash → block number, block number → block hash, (block number, block hash) → body.
+
+Among these, as it is expected, the entries that amount to most of the space are the ones that store the raw RLP information about the block.
+
+The `ancient` datastore is where the objects get moved once they are considered final.
+
+## Ancient
+
+Since v1.9.0, `Go-ethereum` introduces a “freezer” database. Once blocks pass some threshold value (90.000 blocks by default), the header, body, and receipts of the block are moved from the `leveldb` database into an append-only database. Indexes are kept on the quick-access storage.
+
+Values in this ancient database, cannot be updated or deleted. Note that before the Merge and the update to a PoS, this threshold value would have introduced a limit on the max number of block reorgs allowed in the client.
+
+Some of the benefits of moving finalized data to the “freezer” are:
+
+- It reduces the size of the `leveldb` database improving the database performance and compactions.
+- Ancient data has lower operational requirements than `leveldb` so it can be served from cheaper hard drives.
+
+## Ancient format
+
+Each object (Header, Body, and Receipts) is stored in a `table`. A `table` consists of one index file and multiple data files. Any of these files might be compressed with Snappy.
+
+The index file stores sequential entries of 6 bytes each. Each entry represents a block of the canonical chain. Then, the index entry for block 54 would be located at (54\*6) of the index file.
+
+Each entry stores a tuple (file number, offset) that represents where in the content files the data is stored for that entry. Note that since an entry only stores the offset, it is necessary to read the next entry to retrieve the total length of the data (subtract the offsets).
+
+## Example
+
+This is an example of how to iterate over the `Block data` in `Go-ethereum` using the `geth-data-layer` library:
+
+```go
+package main
+
+import (
+	"fmt"
+	gethdatalayer "github.com/umbracle/geth-data-layer"
+)
+
+func main() {
+	store, _ := gethdatalayer.NewStore("..../chaindata")
+
+	iter := store.Iterator()
+	// iter.Seek(1000000)
+
+	for iter.Next() {
+		val, _ := iter.Value()
+		fmt.Println(val.Number)
+	}
+}
+```

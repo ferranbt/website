@@ -1,0 +1,238 @@
+---
+title: "FastSSZ: SZZ encoding on esteroids"
+date: "2020-01-01"
+---
+
+A few years back, the Prysmatic Labs team, developers of the Ethereum Beacon chain [Prysm](https://github.com/prysmaticlabs/prysm) [opened a bounty](https://github.com/prysmaticlabs/prysm/issues/4738) to replace their implementation ([go-ssz](https://github.com/prysmaticlabs/go-ssz)) of the SSZ encoding protocol.
+
+Having worked with [encoding libraries](https://github.com/umbracle/fastrlp) and [high-performance](https://github.com/umbracle/minimal) systems in the blockchain space, I had some ideas I wanted to try out.
+
+After some successful experiments and a little bit of coding, this was the result:
+
+```go
+BenchmarkMarshalGoSSZ-4       	  753160 ns/op	  115112 B/op	    8780 allocs/op
+BenchmarkUnMarshalGoSSZ-4     	  1395097 ns/op	  144608 B/op	    8890 allocs/op
+BenchmarkMarshal_Fast-8           4088 ns/op	    8192 B/op	       1 allocs/op
+BenchmarkMarshal_SuperFast-8      1354 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUnMarshal_Fast-8         17614 ns/op	   11900 B/op	     210 allocs/op
+BenchmarkHashTreeRoot_Fast-8      45932 ns/op	       0 B/op	       0 allocs/op
+```
+
+For those of you who are not used to Go benchmarks, this is an x500 improvement for message encoding over the original (go-ssz) implementation.
+
+In this blog, I want to give a walkthrough into optimizations behind the library and some of the design decisions. I will focus mostly on encoding and hashing (and a bit less on decoding) since that is where most of the high-performance strategies are located.
+
+### What is SSZ?
+
+Simple Serialize (SSZ) is a binary data serialization format used in the Ethereum Beacon chain. It replaces the RLP serialization used in the execution clients. Unlike RLP which only specifies the encoding format, SSZ also defines how the objects are Merkleize efficiently.
+
+SSZ is deterministic and not self-describing, to decode a blob of binary data, the message schema must be known in advance. This differs from Protobuf which encodes in the message itself a description of the format.
+
+Encoding in SSZ is similar in nature to the [ABI format](https://docs.soliditylang.org/en/v0.8.19/abi-spec.html) to interact with smart contracts. The result byte stream is divided into two parts: fixed and heap areas. Basic and static values (i.e. integer, bool, fixed size bytes) are appended to the fixed area while dynamic types are written to the heap area recursively following the same rules. An offset is written in the fixed area to the point in the heap where the value starts.
+
+SSZ objects can also be transformed into a [Merkle-tree](https://www.notion.so/Clickhouse-event-tracker-4e8b68a29f62412a9d44d50ba81216c9?pvs=21) representation. The values of the object are recursively split into chunks of 32 bytes and hashed into a Merkle-tree. Additional empty leaves might be included so that the total number of leaves is a power of 2 and a single hash-tree-root is produced.
+
+### Limitations in Golang
+
+Even though Go does support generic types now, it is still not possible to create a generic data serialization library without the use of the reflect package, a meta-programming tool in Go to determine the shape of the objects at runtime.
+
+A simple encoding library with reflection might look like this:
+
+```go
+func encode(i interface{}) []byte {
+  res := []byte{}
+  switch reflect.TypeOf(i).Kind() {
+    case reflect.Int64:
+      // encode int 64
+		case reflect.String:
+			// encode string
+  }
+}
+```
+
+However, it comes with a cost: it is hard to debug, error-prone, and inefficient.
+
+### An iterative approach to encoding
+
+Before `fastssz`, I built `[fastrlp](https://github.com/umbracle/fastrlp)`, a Go library to encode the RLP format of the execution clients. `fastrlp` is based on `[fastjson](https://github.com/valyala/fastjson)` and follows the same structures and optimizations.
+
+`fastrlp` is not an encoding library, but a set of low-level primitives and utilities to encode/decode objects in RLP. The library is small and low-maintenance and if used correctly, it does not allocate any memory.
+
+This is an example of how to use `fastrlp` to encode a simple object with two fields:
+
+```go
+type Obj struct {
+  A uint64
+  B []byte
+}
+
+func Encode(o *Obj) []byte {
+  a := &fastrlp.Arena{}
+  v := a.NewArray()
+  v.Set(a.NewUint(o.A))
+  v.Set(a.NewBytes(o.B))
+  return v.Marshal(nil)
+}
+```
+
+However, it becomes cumbersome and error-prone to manually write down (and review) the encoding/decoding for each object ([here](https://github.com/0xPolygon/polygon-edge/blob/develop/types/rlp_unmarshal.go), [here](https://github.com/umbracle/ethgo/blob/main/structs_marshal_rlp.go)).
+
+This is less of a problem for RLP since only a handful of small objects require encoding. But, it is not an option for the Beacon chain which has [dozens of objects](https://github.com/ferranbt/fastssz/blob/main/spectests/structs.go) that require SSZ encoding. Thus, I decided to try out code generation to scale the process.
+
+### Code generation is far from perfect
+
+Most often than not, code generation is used to generate language-specific SDK based on some simple and generic configuration format (i.e. Protobuf, OpenAPI, Kubernetes CRDs, etc…).
+
+In this case, though Prism does define the Beacon chain objects as [Protobuf](https://www.notion.so/FastSSZ-SSZ-encoding-on-steroids-e7a2b6eca63b4436936019833a36f8fe?pvs=21), I decided to work with the Go types instead, not to require any extra bindings to make it work. This decision turned out to have mixed results.
+
+On one side, it was adopted by other projects ([here](https://github.com/Snowfork/snowbridge), [here](https://github.com/flashbots/mev-boost-relay)) without requiring Protobuf. On the other, when you take as input any arbitrary Go code (and not a constrained schema) you end up facing many Go-specific syntaxes that need support (or at the very least, design discussions), to name a few: import external packages, import with alias names, multiple-target compilation, type alias, etc…
+
+A positive aspect of SSZ is that currently is only used for the Ethereum [Beacon chain types](https://www.notion.so/FastSSZ-SSZ-encoding-on-steroids-e7a2b6eca63b4436936019833a36f8fe?pvs=21) which are only updated a few times a year. There are not usually new field types that need to be implemented (zero in the last fork).
+
+Thus, on this aspect, once the code has been generated as it is optimal (more on this in the next section) maintenance is minimal.
+
+### Divide and conquer
+
+Something I found useful while I iterated from `fastrlp` to `fastssz` was to split the system into two layers. On one side the set of high-performance low-level primitives and on the other the code generation (aka `sszgen`).
+
+Some of the benefits are:
+
+- You can optimize and benchmark the encoding outside the generated code.
+- The generated code gets more succinct and easier to read and debug ([example](https://github.com/ferranbt/fastssz/blob/main/spectests/structs_encoding.go)).
+- There might be simple scenarios where you want to use the primitives without generating code ([example](https://github.com/umbracle/go-eth-consensus/blob/main/spec/rewards.go#L21)).
+- You can update the library with the primitives without updating the generated code.
+
+### Here be dragons! Zero-memory allocation.
+
+Once you remove reflection from the picture, the biggest sinkhole of memory and CPU cycles is going to be memory allocation. Thus, it was my intention to make `fastssz` a zero-allocation library from the get-go.
+
+First, let's dive in into encoding which is simpler to speed up in SSZ.
+
+Most of the encoding libraries in the literature look like this:
+
+```go
+type Obj struct {
+  Data []byte
+}
+
+func Encode(obj *Obj) []byte {
+  buf := make([]byte)
+  buf = append(buf, obj.Data...)
+  return buf
+}
+```
+
+In this function, byte allocation for the result happens inside the library. Depending on the object, this allocation might vary a lot in size and might have to be rescaled multiple times. Besides, when executed many times, it creates extra pressure on the gc collector both to allocate the bytes and to track its lifecycle.
+
+It should be preferable to shift left the allocation and use a destination buffer like this:
+
+```go
+func Encode(dst []byte, obj *Obj) []byte {
+  dst = append(dst, obj.Data...)
+  return dst
+}
+```
+
+This is similar to the allocation pattern used in the Zig language.
+
+Then, we remove both the allocation and give more options to the user on how to call this function:
+
+```go
+buf := []byte{}
+obj := &Obj{}
+
+// 1. Encoding gets written to the buffer.
+buf = Encode(buf, obj)
+
+// 2. The buffer is reused from the beginning and overwritten with
+// new data.
+buf = Encode(buf[:0], obj)
+
+// 3. A new buffer is created. Original buffer is garbage collected.
+buf = Encode(nil, obj)
+```
+
+Following this pattern, encoding with SSZ is a matter of writing into the destination buffer each field of the object in the correct order ([example](https://github.com/ferranbt/fastssz/blob/main/spectests/structs_encoding.go#L128)).
+
+Let’s look at hashing now. In insight, it follows the same principles as encoding except for a couple of differences:
+
+- The result is not a byte stream but a root hash (32 bytes). But, it requires converting the fields into bytes and allocating those intermediate representations somewhere.
+- While the logic in encoding only involves appending bytes into a buffer, for hashing the logic is more complex and requires merkle tree hashing ([example](https://github.com/ferranbt/fastssz/blob/v0.1.3/hasher.go#L343)).
+
+The pattern to optimize these operations is similar to encoding, but instead of using `[]byte` as the allocation object, we create a `Hasher` object that encapsulates both the complex hashing logic and the allocation of memory. When doing the hashing of an object, a `Hasher` object has to be passed as well to the function.
+
+```go
+type Hasher struct {
+  buf []byte
+}
+
+func (h *Hasher) EncodeBytes(b []byte) {}
+
+func Hash(h *Hasher, obj *Obj) {
+  h.EncodeBytes(obj.Data)
+}
+```
+
+Like in the previous example, it is up now to the user to decide how to call the `Hash` method.
+
+```go
+obj := &Obj{}
+
+// 1. Declare a specific instance (worse case)
+h := &Hasher{}
+Hash(h, obj)
+
+// 2. Use a pool
+var hasherPool = sync.Pool{
+	New: func() interface{} { return new(Hasher) },
+}
+
+h = hasherPool.Get().(*Hasher)
+Hash(h, obj)
+hasherPool.Put(h)
+```
+
+With the `Hasher` object, the generated hashing functions become even more succinct ([here](https://github.com/ferranbt/fastssz/blob/v0.1.3/spectests/structs_encoding.go#L176)) than the encoding.
+
+### Scotty, we need more power!
+
+One thing you have to be mindful is that it does not matter how fast the library is, most often than not, that speed comes with a cost in developer experience. Then, it boils down to what the developer is willing to use and what makes sense for its use case.
+
+In `fastssz` I tried to provide different function flavors with distinct tradeoffs.
+
+In the case of the encoding, two functions are generated, one with and another without the destination buffer:
+
+```go
+func (o *Object) Size() int {}
+
+func (o *Object) MarshalTo(dst []byte) []byte {}
+
+func (o *Object) Marshal() []byte {
+  buf := make([]byte, o.Size())
+  return o.MarshalTo(buf[:0])
+}
+```
+
+An extra function `Size` is generated and it returns the total size in bytes of the encoded object. Thus, even the less efficient `Marshal` function only allocates memory once.
+
+For hashing, two functions are generated:
+
+```go
+// fastssz api
+func HashWithDefaultHasher(v HashRoot) ([32]byte, error) {
+	hh := DefaultHasherPool.Get()
+	v.HashTreeRootWith(hh)
+	root := hh.HashRoot()
+	DefaultHasherPool.Put(hh)
+	return root, err
+}
+
+// generated code
+func (o *Object) HashTreeRootWith(h *Hasher) {}
+
+func (o *Object) HashTreeRoot() [32]byte {
+ return fastssz.HashWithDefaultHasher(o)
+}
+```
+
+The first function is the low-level one with the allocator while the second one is a more DX-friendly version using the default pool of allocators.
